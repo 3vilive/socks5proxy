@@ -1,7 +1,6 @@
 use tokio::io::{self, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use std::net::{SocketAddr};
-use std::{u16};
+use std::{u16, str};
 
 
 #[tokio::main]
@@ -49,18 +48,36 @@ async fn process_socks5_proxy(socket: TcpStream) -> io::Result<()> {
     rd.read_exact(&mut connect_buf).await?;
 
 
+    // parse dst addr
+    // 0x1 IPv4 4 bytes
+    // 0x3 hostname first byte as length
+    // 0x4 IPv6 16 bytes
     let atyp = connect_buf[3];
-    // 0x1 ipv4 4 bytes
-    // 0x2 hostname first byte as length
-    // 0x3 ipv6 16 bytes
-
     let dst_addr: String;
     match atyp {
         0x1 => {
-            // ipv4 4 bytes
+            // IPv4 4 bytes
             let mut ipv4_buf = [0; 4];
             rd.read_exact(&mut ipv4_buf).await?;
             dst_addr = format!("{}.{}.{}.{}", ipv4_buf[0], ipv4_buf[1], ipv4_buf[2], ipv4_buf[3])
+        },
+        0x3 => {
+            // hostname
+            let mut nhostname_buf = [0; 1];
+            rd.read_exact(&mut nhostname_buf).await?;
+
+            let mut hostname_buf = vec![0; nhostname_buf[0] as usize];
+            rd.read_exact(&mut hostname_buf).await?;
+
+            dst_addr = match str::from_utf8(&hostname_buf) {
+                Ok(hostname) => {
+                    hostname.to_string()
+                },
+                Err(err) => {
+                    let wrap_err = io::Error::new(io::ErrorKind::Other, format!("parse buffer error: {:?}", err));
+                    return Err(wrap_err)
+                },
+            };
         },
         _ => {
             let err = io::Error::new(io::ErrorKind::Other, format!("unsupported atype {}", atyp));
@@ -71,14 +88,19 @@ async fn process_socks5_proxy(socket: TcpStream) -> io::Result<()> {
     let mut dst_port_buf = [0; 2];
     rd.read_exact(&mut dst_port_buf).await?;
     let dst_port = u16::from_be_bytes(dst_port_buf);
+    let dst_addr = format!("{}:{}", dst_addr, dst_port);
 
-    let dst_socket = TcpStream::connect(format!("{}:{}", dst_addr, dst_port)).await?;
+    println!("dst_addr: {}", dst_addr);
+
+    let dst_socket = TcpStream::connect(dst_addr).await?;
     let (mut dst_rd, mut dst_wr) = io::split(dst_socket);
 
     // tell client we are ready
     // ver rep rsv atyp bnd.addr bnd.prot
     wr.write(&[0x5, 0x0, 0x0, 0x1, 0x0, 0x0, 0x0, 0x0, 0x0, 0x50]).await?;
 
+
+    // forward
     let t1 = tokio::spawn(async move {
         if let Err(err) = io::copy(&mut rd, &mut dst_wr).await {
             println!("copy reader to dst writer error: {:?}", err);
